@@ -28,8 +28,8 @@ type Server struct {
 	HostKey         ssh.Signer
 	ClientPublicKey ssh.PublicKey
 	Authorize       Authorizer
-	// Turnkey signs upstream logins for grants that name a turnkey_key.
-	Turnkey          *TurnkeySigner
+	// RemoteSigner signs upstream logins for grants that name a remote_key.
+	RemoteSigner     RemoteSigner
 	Guard            *dnsguard.Guard
 	Audit            transform.AuditFunc
 	TLSRootCAs       *x509.CertPool
@@ -241,12 +241,12 @@ func (s *Server) connect(ctx context.Context, user string, key ssh.PublicKey, de
 	}
 	sess.grant = grant
 	var credential ssh.Signer
-	if grant.TurnkeyKey == nil {
+	if grant.RemoteKey == nil {
 		if credential, err = signer(ctx, grant.PrivateKey, s.Logger); err != nil {
 			return sess, err
 		}
-	} else if s.Turnkey == nil {
-		return sess, errors.New("turnkey signing not configured")
+	} else if s.RemoteSigner == nil {
+		return sess, errors.New("SSH remote signer not configured")
 	}
 	var expected ssh.PublicKey
 	var algorithms []string
@@ -261,12 +261,9 @@ func (s *Server) connect(ctx context.Context, user string, key ssh.PublicKey, de
 		}
 	}
 	var keyExchanges []string
-	if grant.TurnkeyKey != nil {
-		// Turnkey verifies the server's host-key signature over the session, for these host key types only.
-		if expected == nil {
-			algorithms = []string{ssh.KeyAlgoED25519, ssh.KeyAlgoECDSA256}
-		} else if t := expected.Type(); t != ssh.KeyAlgoED25519 && t != ssh.KeyAlgoECDSA256 {
-			return sess, errors.New("turnkey signing requires an ssh-ed25519 or ecdsa-sha2-nistp256 host key")
+	if grant.RemoteKey != nil {
+		if algorithms, err = remoteHostKeyAlgorithms(s.RemoteSigner, expected); err != nil {
+			return sess, err
 		}
 		keyExchanges = hostProofKeyExchanges
 	}
@@ -280,11 +277,11 @@ func (s *Server) connect(ctx context.Context, user string, key ssh.PublicKey, de
 	}
 	var accepted atomic.Pointer[ssh.PublicKey]
 	upstream := netConn
-	if grant.TurnkeyKey != nil {
+	if grant.RemoteKey != nil {
 		kex := recordKex(netConn)
 		upstream = kex
 		// ctx bounds approval waits to the downstream handshake deadline.
-		credential, err = s.Turnkey.signer(ctx, *grant.TurnkeyKey, kex, func() ssh.PublicKey {
+		credential, err = newRemoteUserauthSigner(ctx, s.RemoteSigner, *grant.RemoteKey, kex, func() ssh.PublicKey {
 			if key := accepted.Load(); key != nil {
 				return *key
 			}
@@ -378,8 +375,8 @@ func validateGrant(g *Grant) error {
 		return errors.New("SSH host key required")
 	}
 	hasPrivateKey := g.PrivateKey.Kind != 0 && g.PrivateKey.Tag != "!!null"
-	if hasPrivateKey == (g.TurnkeyKey != nil) {
-		return errors.New("SSH grant must name exactly one of private_key or turnkey_key")
+	if hasPrivateKey == (g.RemoteKey != nil) {
+		return errors.New("SSH grant must name exactly one of private_key or remote_key")
 	}
 	return nil
 }

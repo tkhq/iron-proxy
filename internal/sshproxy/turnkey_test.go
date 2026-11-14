@@ -16,14 +16,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
-	"gopkg.in/yaml.v3"
 
 	"github.com/ironsh/iron-proxy/internal/transform"
 )
@@ -145,14 +143,6 @@ func verifySessionBind(t *testing.T, data, bind []byte) []byte {
 	return parsed.HostKey
 }
 
-func turnkeyGrant(t *testing.T, address string, host, upstreamKey ssh.Signer) *Grant {
-	t.Helper()
-	g := grant(t, address, host, nil)
-	g.PrivateKey = yaml.Node{}
-	g.TurnkeyKey = &TurnkeyKey{SignWith: "turnkey-key-id", PublicKey: strings.TrimSpace(string(ssh.MarshalAuthorizedKey(upstreamKey.PublicKey())))}
-	return g
-}
-
 func ecdsaKey(t *testing.T) ssh.Signer {
 	t.Helper()
 	private, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -185,8 +175,8 @@ func TestTurnkeyKeySignsUpstreamLogin(t *testing.T) {
 			clientKey, _ := key(t)
 			proxyHost, _ := key(t)
 			fake, turnkey, upstreamKey := newFakeTurnkey(t, "ACTIVITY_STATUS_COMPLETED")
-			g := turnkeyGrant(t, testBackend(t, tc.host, upstreamKey), tc.host, upstreamKey)
-			address, audits := serveProxy(t, &Server{HostKey: proxyHost, ClientPublicKey: clientKey.PublicKey(), Authorize: (&recordAuth{g: g}).authorize, Turnkey: turnkey})
+			g := remoteGrant(t, testBackend(t, tc.host, upstreamKey), tc.host, upstreamKey)
+			address, audits := serveProxy(t, &Server{HostKey: proxyHost, ClientPublicKey: clientKey.PublicKey(), Authorize: (&recordAuth{g: g}).authorize, RemoteSigner: turnkey})
 			client, err := connect(address, clientKey, proxyHost)
 			require.NoError(t, err)
 			defer func() { _ = client.Close() }()
@@ -221,8 +211,8 @@ func TestTurnkeyApprovalWaitsWithinHandshake(t *testing.T) {
 			backendHost, _ := key(t)
 			fake, turnkey, upstreamKey := newFakeTurnkey(t, "ACTIVITY_STATUS_CONSENSUS_NEEDED")
 			fake.approveAfter = tc.approveAfter
-			g := turnkeyGrant(t, testBackend(t, backendHost, upstreamKey), backendHost, upstreamKey)
-			address, audits := serveProxy(t, &Server{HostKey: proxyHost, ClientPublicKey: clientKey.PublicKey(), Authorize: (&recordAuth{g: g}).authorize, Turnkey: turnkey, HandshakeTimeout: 500 * time.Millisecond})
+			g := remoteGrant(t, testBackend(t, backendHost, upstreamKey), backendHost, upstreamKey)
+			address, audits := serveProxy(t, &Server{HostKey: proxyHost, ClientPublicKey: clientKey.PublicKey(), Authorize: (&recordAuth{g: g}).authorize, RemoteSigner: turnkey, HandshakeTimeout: 500 * time.Millisecond})
 			client, err := connect(address, clientKey, proxyHost)
 			if tc.wantErr == "" {
 				require.NoError(t, err)
@@ -245,10 +235,10 @@ func TestTurnkeyRefusalsFailClosed(t *testing.T) {
 		reject bool
 		errMsg string
 	}{
-		{name: "policy rejection", status: "ACTIVITY_STATUS_REJECTED", reject: true, errMsg: "turnkey denied the signature"},
+		{name: "policy rejection", status: "ACTIVITY_STATUS_REJECTED", reject: true, errMsg: "turnkey: SSH access denied: remote signer denied the signature"},
 		{name: "failed activity", status: "ACTIVITY_STATUS_FAILED", errMsg: "turnkey signing activity failed"},
-		{name: "unsupported host key", status: "ACTIVITY_STATUS_COMPLETED", host: rsaKey, errMsg: "requires an ssh-ed25519 or ecdsa-sha2-nistp256 host key"},
-		{name: "signing not configured", status: "ACTIVITY_STATUS_COMPLETED", server: func(s *Server) { s.Turnkey = nil }, errMsg: "turnkey signing not configured"},
+		{name: "unsupported host key", status: "ACTIVITY_STATUS_COMPLETED", host: rsaKey, errMsg: "remote signer does not support ssh-rsa host keys"},
+		{name: "signing not configured", status: "ACTIVITY_STATUS_COMPLETED", server: func(s *Server) { s.RemoteSigner = nil }, errMsg: "SSH remote signer not configured"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -259,8 +249,8 @@ func TestTurnkeyRefusalsFailClosed(t *testing.T) {
 				backendHost = tc.host(t)
 			}
 			_, turnkey, upstreamKey := newFakeTurnkey(t, tc.status)
-			g := turnkeyGrant(t, testBackend(t, backendHost, upstreamKey), backendHost, upstreamKey)
-			server := &Server{HostKey: proxyHost, ClientPublicKey: clientKey.PublicKey(), Authorize: (&recordAuth{g: g}).authorize, Turnkey: turnkey}
+			g := remoteGrant(t, testBackend(t, backendHost, upstreamKey), backendHost, upstreamKey)
+			server := &Server{HostKey: proxyHost, ClientPublicKey: clientKey.PublicKey(), Authorize: (&recordAuth{g: g}).authorize, RemoteSigner: turnkey}
 			if tc.server != nil {
 				tc.server(server)
 			}
@@ -287,7 +277,7 @@ func TestTurnkeyErrorsDoNotLeakResponses(t *testing.T) {
 		errMsg string
 	}{
 		{"redirect is not followed", http.StatusFound, nil, "status 302"},
-		{"forbidden is a denial", http.StatusForbidden, errAccessDenied, "turnkey denied the signature"},
+		{"forbidden is a denial", http.StatusForbidden, ErrSignatureDenied, "remote signer denied the signature"},
 		{"server error", http.StatusInternalServerError, nil, "status 500"},
 	}
 	for _, tc := range cases {

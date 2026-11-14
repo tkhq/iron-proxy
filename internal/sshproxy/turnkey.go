@@ -15,11 +15,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -28,16 +30,7 @@ const (
 	turnkeyApprovalPollInterval = time.Second
 )
 
-// TurnkeyKey names a Turnkey-held Ed25519 key that signs upstream logins in
-// place of a private_key source. The key never leaves Turnkey.
-type TurnkeyKey struct {
-	// SignWith is the Turnkey private key ID or address.
-	SignWith string `json:"sign_with" yaml:"sign_with"`
-	// PublicKey is the key's ssh-ed25519 public key in authorized-key format.
-	PublicKey string `json:"public_key" yaml:"public_key"`
-}
-
-// TurnkeySigner submits ACTIVITY_TYPE_SIGN_SSH_USERAUTH activities with a
+// TurnkeySigner is a RemoteSigner that submits ACTIVITY_TYPE_SIGN_SSH_USERAUTH activities with a
 // proxy-only API key. Turnkey verifies the login request and the server's
 // host-key signature over the session before policy evaluates the user,
 // service, and host key fingerprint.
@@ -48,6 +41,21 @@ type TurnkeySigner struct {
 	Client         *http.Client
 	// PollInterval paces approval polling; 0 means one second.
 	PollInterval time.Duration
+}
+
+func buildTurnkeySigner(node yaml.Node) (*TurnkeySigner, error) {
+	var cfg struct {
+		BaseURL          string `yaml:"base_url"`
+		OrganizationID   string `yaml:"organization_id"`
+		APIPrivateKeyEnv string `yaml:"api_private_key_env"`
+	}
+	if node.Decode(&cfg) != nil {
+		return nil, errors.New("invalid turnkey remote signer configuration")
+	}
+	if cfg.APIPrivateKeyEnv == "" {
+		cfg.APIPrivateKeyEnv = defaultTurnkeyAPIKeyEnv
+	}
+	return NewTurnkeySigner(cfg.BaseURL, cfg.OrganizationID, os.Getenv(cfg.APIPrivateKeyEnv))
 }
 
 // NewTurnkeySigner builds a signer from a hex-encoded P-256 Turnkey API private key.
@@ -79,52 +87,21 @@ func NewTurnkeySigner(baseURL, organizationID, apiPrivateKey string) (*TurnkeySi
 	}, nil
 }
 
-// signer returns an ssh.Signer for key. It signs only userauth requests from
-// the connection recorded by kex, waiting for approval no longer than ctx.
-func (t *TurnkeySigner) signer(ctx context.Context, key TurnkeyKey, kex *kexRecorder, host func() ssh.PublicKey) (ssh.Signer, error) {
-	public, _, _, _, err := ssh.ParseAuthorizedKey([]byte(key.PublicKey))
-	if err != nil || public.Type() != ssh.KeyAlgoED25519 || key.SignWith == "" {
-		return nil, errors.New("invalid turnkey SSH key")
-	}
-	return &turnkeyUserauthSigner{ctx: ctx, turnkey: t, key: key, public: public, kex: kex, host: host}, nil
+// HostKeyAlgorithms lists the host key types Turnkey verifies session-binds for.
+func (t *TurnkeySigner) HostKeyAlgorithms() []string {
+	return []string{ssh.KeyAlgoED25519, ssh.KeyAlgoECDSA256}
 }
 
-type turnkeyUserauthSigner struct {
-	ctx     context.Context
-	turnkey *TurnkeySigner
-	key     TurnkeyKey
-	public  ssh.PublicKey
-	kex     *kexRecorder
-	host    func() ssh.PublicKey
-}
-
-func (s *turnkeyUserauthSigner) PublicKey() ssh.PublicKey { return s.public }
-
-func (s *turnkeyUserauthSigner) Sign(_ io.Reader, data []byte) (*ssh.Signature, error) {
-	// RFC 4252 section 7: the signed data starts with the session identifier.
-	sessionID, _, ok := sshString(data)
-	if !ok {
-		return nil, errors.New("SSH userauth data malformed")
+// SignUserauth signs req with the Ed25519 key req.KeyID names, a Turnkey private key ID or address.
+func (t *TurnkeySigner) SignUserauth(ctx context.Context, req UserauthRequest) (*ssh.Signature, error) {
+	if req.PublicKey.Type() != ssh.KeyAlgoED25519 {
+		return nil, errors.New("turnkey SSH keys must be ssh-ed25519")
 	}
-	proof, err := s.kex.result()
+	signature, err := t.signUserauth(ctx, req.KeyID, req.Data, req.SessionBind)
 	if err != nil {
 		return nil, err
 	}
-	// The recorded reply must be from the key the host key callback accepted.
-	host := s.host()
-	if host == nil || !bytes.Equal(host.Marshal(), proof.hostKey) {
-		return nil, errors.New("SSH host proof does not match the verified host key")
-	}
-	signature, err := s.turnkey.signUserauth(s.ctx, s.key.SignWith, data, sessionBind(proof, sessionID))
-	if err != nil {
-		return nil, err
-	}
-	result := &ssh.Signature{Format: ssh.KeyAlgoED25519, Blob: signature}
-	// Catch a key mismatch locally rather than as an opaque upstream login failure.
-	if s.public.Verify(data, result) != nil {
-		return nil, errors.New("turnkey signature does not match the granted public key")
-	}
-	return result, nil
+	return &ssh.Signature{Format: ssh.KeyAlgoED25519, Blob: signature}, nil
 }
 
 type turnkeyActivity struct {
@@ -137,8 +114,7 @@ type turnkeyActivity struct {
 	} `json:"result"`
 }
 
-// errTurnkeyDenied wraps errAccessDenied so audits record policy denials as rejections.
-var errTurnkeyDenied = fmt.Errorf("%w: turnkey denied the signature", errAccessDenied)
+var errTurnkeyDenied = fmt.Errorf("turnkey: %w", ErrSignatureDenied)
 
 var turnkeyActivityIDPattern = regexp.MustCompile(`^[0-9a-fA-F-]{1,64}$`)
 

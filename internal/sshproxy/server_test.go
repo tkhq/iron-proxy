@@ -552,10 +552,10 @@ func TestValidateGrant(t *testing.T) {
 		{"TLS identity over TCP", func(g *Grant) { g.TLSIdentity, g.HostKey = true, "" }, false},
 		{"TLS identity over WSS", func(g *Grant) { g.TLSIdentity, g.HostKey, g.Destination = true, "", "wss://example.com/events" }, true},
 		{"TLS identity with host pin", func(g *Grant) { g.TLSIdentity, g.Destination = true, "wss://example.com/events" }, false},
-		{"turnkey key instead of private key", func(g *Grant) {
-			g.PrivateKey, g.TurnkeyKey = yaml.Node{}, &TurnkeyKey{SignWith: "key", PublicKey: "ssh-ed25519 AAAA"}
+		{"remote key instead of private key", func(g *Grant) {
+			g.PrivateKey, g.RemoteKey = yaml.Node{}, &RemoteKey{KeyID: "key", PublicKey: "ssh-ed25519 AAAA"}
 		}, true},
-		{"turnkey key and private key", func(g *Grant) { g.TurnkeyKey = &TurnkeyKey{SignWith: "key", PublicKey: "ssh-ed25519 AAAA"} }, false},
+		{"remote key and private key", func(g *Grant) { g.RemoteKey = &RemoteKey{KeyID: "key", PublicKey: "ssh-ed25519 AAAA"} }, false},
 		{"no upstream credential", func(g *Grant) { g.PrivateKey = yaml.Node{} }, false},
 	}
 	for _, tc := range cases {

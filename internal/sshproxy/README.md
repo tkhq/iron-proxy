@@ -44,27 +44,32 @@ client keys, and per-request authorization remain mandatory. WSS implements
 the wstunnel v11 default unmasked framing and routing handshake with a fixed remote target `127.0.0.1:22`.
 The JWT is protocol metadata, not an authentication credential.
 
-### Turnkey-held upstream keys
+### Remote signers
 
-A grant may return `turnkey_key` (`sign_with`, the Turnkey private key ID or
-address, and `public_key`, its `ssh-ed25519` authorized key) in place of
-`private_key`; a grant naming both or neither is rejected. The key never
-leaves Turnkey: each upstream login submits an `ACTIVITY_TYPE_SIGN_SSH_USERAUTH`
-activity with the userauth request and a `session-bind@openssh.com` proof built
-from the server's first key exchange reply (its host key and signature over
-the session ID). Turnkey verifies both before policy sees the SSH user,
-service, and host key fingerprint, so policy can restrict the key to specific
-hosts. Enable it with an `ssh.turnkey` block containing `organization_id`,
-optional `api_private_key_env` (default `TURNKEY_API_PRIVATE_KEY`, a
-proxy-only P-256 API key), and optional `base_url`.
+A grant may return `remote_key` (`key_id`, the signer's identifier for the
+key, and `public_key`, its authorized key) in place of `private_key`; a grant
+naming both or neither is rejected. The private key stays with the remote
+signer configured in an `ssh.remote_signer` block, selected by `type`. Each
+upstream login sends the signer the userauth data and a
+`session-bind@openssh.com` proof built from the server's first key exchange
+reply (its host key and signature over the session ID), so the signer can
+verify the destination itself rather than trust the proxy.
 
 These grants negotiate only key exchanges whose reply carries the host-key
 signature (`mlkem768x25519-sha256`, `curve25519-sha256`, `ecdh-sha2-*`) and only
-`ssh-ed25519` or `ecdsa-sha2-nistp256` host keys. An activity that needs
-approval is polled until the handshake deadline; a signature is bound to one
-session and is never reused. A rejection is audited as an authorization denial
-and blocks new logins; it does not end established sessions, which the lease
-still governs. There is no fallback to `private_key` or to raw signing.
+host key types the signer supports. The signer may wait for approval until the
+handshake deadline; a signature is bound to one session and is never reused.
+A denial is audited as an authorization denial and blocks new logins; it does
+not end established sessions, which the lease still governs. There is no
+fallback to `private_key`.
+
+`type: turnkey` signs with a Turnkey-held Ed25519 key (`key_id` is the Turnkey
+private key ID or address) through `ACTIVITY_TYPE_SIGN_SSH_USERAUTH`. Turnkey
+verifies the session-bind before policy sees the SSH user, service, and host
+key fingerprint, so policy can restrict the key to specific hosts. It takes
+`organization_id`, optional `api_private_key_env` (default
+`TURNKEY_API_PRIVATE_KEY`, a proxy-only P-256 API key), and optional
+`base_url`, and supports `ssh-ed25519` and `ecdsa-sha2-nistp256` host keys.
 
 The lease is renewed every five seconds. Expiry, authorization failure, or a
 change to any grant field except expiry closes the active connection. Authorizer

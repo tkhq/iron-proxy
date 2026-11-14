@@ -31,9 +31,9 @@ type Grant struct {
 	HostKey     string    `json:"host_key" yaml:"host_key"`
 	TLSIdentity bool      `json:"tls_identity,omitempty" yaml:"tls_identity"`
 	PrivateKey  yaml.Node `json:"-" yaml:"private_key"`
-	// TurnkeyKey replaces PrivateKey with a Turnkey-held key; a grant names exactly one.
-	TurnkeyKey *TurnkeyKey `json:"turnkey_key,omitempty" yaml:"turnkey_key"`
-	ExpiresAt  time.Time   `json:"expires_at" yaml:"expires_at"`
+	// RemoteKey replaces PrivateKey with a key held by the remote signer; a grant names exactly one.
+	RemoteKey *RemoteKey `json:"remote_key,omitempty" yaml:"remote_key"`
+	ExpiresAt time.Time  `json:"expires_at" yaml:"expires_at"`
 }
 
 // Authorization identifies a sandbox key and a configured route, never a user.
@@ -118,11 +118,7 @@ func LoadFromNode(ctx context.Context, node yaml.Node, guard *dnsguard.Guard, au
 		ClientPublicKey string    `yaml:"client_public_key"`
 		AuthorizeURL    string    `yaml:"authorize_url"`
 		TokenEnv        string    `yaml:"token_env"`
-		Turnkey         *struct {
-			BaseURL          string `yaml:"base_url"`
-			OrganizationID   string `yaml:"organization_id"`
-			APIPrivateKeyEnv string `yaml:"api_private_key_env"`
-		} `yaml:"turnkey"`
+		RemoteSigner    yaml.Node `yaml:"remote_signer"`
 	}
 	if node.Decode(&cfg) != nil || cfg.Listen == "" || cfg.AuthorizeURL == "" {
 		return nil, nil, errors.New("SSH listen address and authorization URL required")
@@ -141,14 +137,9 @@ func LoadFromNode(ctx context.Context, node yaml.Node, guard *dnsguard.Guard, au
 	if token == "" {
 		return nil, nil, errors.New("SSH proxy token unavailable")
 	}
-	var turnkey *TurnkeySigner
-	if cfg.Turnkey != nil {
-		env := cfg.Turnkey.APIPrivateKeyEnv
-		if env == "" {
-			env = defaultTurnkeyAPIKeyEnv
-		}
-		turnkey, err = NewTurnkeySigner(cfg.Turnkey.BaseURL, cfg.Turnkey.OrganizationID, os.Getenv(env))
-		if err != nil {
+	var remote RemoteSigner
+	if cfg.RemoteSigner.Kind != 0 && cfg.RemoteSigner.Tag != "!!null" {
+		if remote, err = BuildRemoteSigner(cfg.RemoteSigner, logger); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -156,6 +147,6 @@ func LoadFromNode(ctx context.Context, node yaml.Node, guard *dnsguard.Guard, au
 	if err != nil {
 		return nil, nil, errors.New("SSH listener unavailable")
 	}
-	server := &Server{HostKey: host, ClientPublicKey: key, Authorize: HTTPAuthorizer(cfg.AuthorizeURL, token), Turnkey: turnkey, Guard: guard, Audit: audit, Logger: logger}
+	server := &Server{HostKey: host, ClientPublicKey: key, Authorize: HTTPAuthorizer(cfg.AuthorizeURL, token), RemoteSigner: remote, Guard: guard, Audit: audit, Logger: logger}
 	return server, listener, nil
 }

@@ -17,18 +17,6 @@ const (
 	msgKexReply = 31
 )
 
-// Kex algorithms whose message 31 is the server's reply (string host key,
-// string server value, string signature over the exchange hash). Group
-// exchange is excluded because its message 31 carries the group instead.
-var hostProofKeyExchanges = []string{
-	ssh.KeyExchangeMLKEM768X25519,
-	ssh.KeyExchangeCurve25519,
-	"curve25519-sha256@libssh.org",
-	ssh.KeyExchangeECDHP256,
-	ssh.KeyExchangeECDHP384,
-	ssh.KeyExchangeECDHP521,
-}
-
 // Bounds on what the recorder buffers before the first NEWKEYS. RFC 4253
 // section 6.1 requires support for 35000-byte packets; x/crypto accepts 256 KiB.
 const (
