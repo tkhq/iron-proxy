@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ironsh/iron-proxy/internal/dnsguard"
@@ -24,9 +25,11 @@ import (
 
 // Server accepts only its paired sandbox's disposable public key.
 type Server struct {
-	HostKey          ssh.Signer
-	ClientPublicKey  ssh.PublicKey
-	Authorize        Authorizer
+	HostKey         ssh.Signer
+	ClientPublicKey ssh.PublicKey
+	Authorize       Authorizer
+	// Turnkey signs upstream logins for grants that name a turnkey_key.
+	Turnkey          *TurnkeySigner
 	Guard            *dnsguard.Guard
 	Audit            transform.AuditFunc
 	TLSRootCAs       *x509.CertPool
@@ -237,9 +240,13 @@ func (s *Server) connect(ctx context.Context, user string, key ssh.PublicKey, de
 		return sess, err
 	}
 	sess.grant = grant
-	credential, err := signer(ctx, grant.PrivateKey, s.Logger)
-	if err != nil {
-		return sess, err
+	var credential ssh.Signer
+	if grant.TurnkeyKey == nil {
+		if credential, err = signer(ctx, grant.PrivateKey, s.Logger); err != nil {
+			return sess, err
+		}
+	} else if s.Turnkey == nil {
+		return sess, errors.New("turnkey signing not configured")
 	}
 	var expected ssh.PublicKey
 	var algorithms []string
@@ -253,6 +260,16 @@ func (s *Server) connect(ctx context.Context, user string, key ssh.PublicKey, de
 			algorithms = []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256}
 		}
 	}
+	var keyExchanges []string
+	if grant.TurnkeyKey != nil {
+		// Turnkey verifies the server's host-key signature over the session, for these host key types only.
+		if expected == nil {
+			algorithms = []string{ssh.KeyAlgoED25519, ssh.KeyAlgoECDSA256}
+		} else if t := expected.Type(); t != ssh.KeyAlgoED25519 && t != ssh.KeyAlgoECDSA256 {
+			return sess, errors.New("turnkey signing requires an ssh-ed25519 or ecdsa-sha2-nistp256 host key")
+		}
+		keyExchanges = hostProofKeyExchanges
+	}
 	netConn, err := transport(ctx, grant.Destination, s.Guard, s.TLSRootCAs)
 	if err != nil {
 		return sess, fmt.Errorf("SSH upstream unavailable: %w", err)
@@ -261,7 +278,25 @@ func (s *Server) connect(ctx context.Context, user string, key ssh.PublicKey, de
 		_ = netConn.Close()
 		return sess, err
 	}
+	var accepted atomic.Pointer[ssh.PublicKey]
+	upstream := netConn
+	if grant.TurnkeyKey != nil {
+		kex := recordKex(netConn)
+		upstream = kex
+		// ctx bounds approval waits to the downstream handshake deadline.
+		credential, err = s.Turnkey.signer(ctx, *grant.TurnkeyKey, kex, func() ssh.PublicKey {
+			if key := accepted.Load(); key != nil {
+				return *key
+			}
+			return nil
+		})
+		if err != nil {
+			_ = netConn.Close()
+			return sess, err
+		}
+	}
 	config := &ssh.ClientConfig{
+		Config:            ssh.Config{KeyExchanges: keyExchanges},
 		User:              grant.Username,
 		Auth:              []ssh.AuthMethod{ssh.PublicKeys(credential)},
 		HostKeyAlgorithms: algorithms,
@@ -272,12 +307,15 @@ func (s *Server) connect(ctx context.Context, user string, key ssh.PublicKey, de
 			if expected != nil && !bytes.Equal(expected.Marshal(), actual.Marshal()) {
 				return errors.New("SSH host identity mismatch")
 			}
+			if accepted.Load() == nil {
+				accepted.Store(&actual)
+			}
 			return nil
 		},
 	}
 	// NewClientConn ignores ctx; shutdown or revocation must still interrupt it.
 	stop := context.AfterFunc(ctx, func() { _ = netConn.Close() })
-	conn, chans, reqs, err := ssh.NewClientConn(netConn, grant.Destination, config)
+	conn, chans, reqs, err := ssh.NewClientConn(upstream, grant.Destination, config)
 	if !stop() {
 		err = errors.Join(err, ctx.Err())
 	}
@@ -338,6 +376,10 @@ func validateGrant(g *Grant) error {
 		}
 	} else if g.HostKey == "" {
 		return errors.New("SSH host key required")
+	}
+	hasPrivateKey := g.PrivateKey.Kind != 0 && g.PrivateKey.Tag != "!!null"
+	if hasPrivateKey == (g.TurnkeyKey != nil) {
+		return errors.New("SSH grant must name exactly one of private_key or turnkey_key")
 	}
 	return nil
 }
